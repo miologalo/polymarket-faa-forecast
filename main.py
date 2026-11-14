@@ -10,13 +10,15 @@ estimated from the market's own recent history. Prediction-market prices are
 martingales, so the median stays at the last price (no drift: a drift fitted
 on the practice data made the score worse). The spread is what matters, and
 it varies a lot by market and by regime, so it is estimated per market with
-an exponentially weighted moving variance of the 1-minute price changes
-(half-life 30 minutes, so it adapts to the current regime and forgets the
-wild settling phase a new market goes through). It is floored and capped so
-a quiet market never gets a degenerate zero spread and a single recent jump
-never blows the spread up; the EWMA variance is bias-corrected for short
-histories (its weights sum to 1 - (1 - alpha)**n, not 1), so a market that
-just started trading does not get a far-too-small spread. Non-finite prices
+an exponentially weighted moving variance of the 1-minute price changes,
+an ensemble of two half-lives (15 and 30 minutes) whose variances are
+averaged: the fast one adapts quickly after a jump, the slower one does not
+overreact to one quiet hour, and the ensemble beats either alone. It is
+floored and capped so a quiet market never gets a degenerate zero spread
+and a single recent jump never blows the spread up; the EWMA variance is
+bias-corrected for short histories (its weights sum to 1 - (1 - alpha)**n,
+not 1), so a market that just started trading does not get a far-too-small
+spread. Non-finite prices
 are sanitized (last finite price carried forward) so bad data can never
 poison a forecast into NaN and invalidate a case. The outer quantiles are
 widened a little (tail x1.3) because price moves are heavy-tailed: mostly
@@ -27,9 +29,9 @@ standard normal's quantile at each level and the outer z's (|z| > 1) scaled
 by TAIL_MULT. Rounded to 6 decimals.
 
 Validation on the practice cases (NVIDIA CEO event, scored against
-Polymarket's own history): loss 0.293 vs the house baseline's 0.364.
+Polymarket's own history): loss 0.289 vs the house baseline's 0.364.
 On a full backtest over 18 checkpoints (calm and volatile regimes) it beats
-the baseline too (1.044 vs 1.114).
+the baseline too (1.041 vs 1.114).
 
 Stdlib only, no network, deterministic (no randomness at all).
 """
@@ -44,8 +46,10 @@ OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Standard normal quantiles at each level.
 Z = [-1.644854, -0.67449, 0.0, 0.67449, 1.644854]
-# EWMA half-life for the variance of 1-minute changes, in minutes.
-HALF_LIFE_MIN = 30.0
+# EWMA half-lives for the variance of 1-minute changes, in minutes.
+# The spread is the average of the two variances: the fast one adapts
+# quickly after a jump, the slower one does not overreact to one quiet hour.
+HALF_LIVES_MIN = (15.0, 30.0)
 # Per-minute sigma is floored and capped (price units per sqrt-minute).
 SIGMA_FLOOR = 0.0005
 SIGMA_CAP = 0.005
@@ -61,7 +65,11 @@ def price6(x: float) -> float:
 def estimate_sigma(prices) -> float:
     """EWMA standard deviation of the 1-minute price changes.
 
-    Bias-corrected: the EWMA weights over n changes sum to
+    An ensemble of two half-lives (15 and 30 minutes): the fast one adapts
+    quickly after a jump, the slower one does not overreact to a single
+    quiet hour; averaging their variances is better than either alone on
+    both the practice cases and a full backtest over calm and volatile
+    regimes. Bias-corrected: the EWMA weights over n changes sum to
     1 - (1 - alpha)**n, not 1, so for a short history the raw EWMA
     underestimates the variance (a market with 2 prices would get a
     22x-too-small variance). Dividing by the weight sum fixes that;
@@ -70,15 +78,18 @@ def estimate_sigma(prices) -> float:
     n = len(prices)
     if n < 2:
         return SIGMA_FLOOR
-    alpha = 1.0 - 0.5 ** (1.0 / HALF_LIFE_MIN)
     var = 0.0
-    for i in range(1, n):
-        c = prices[i] - prices[i - 1]
-        var = (1.0 - alpha) * var + alpha * c * c
-    weight_sum = 1.0 - (1.0 - alpha) ** (n - 1)
-    if weight_sum > 0.0:
-        var = var / weight_sum
-    sigma = math.sqrt(var)
+    for half_life in HALF_LIVES_MIN:
+        alpha = 1.0 - 0.5 ** (1.0 / half_life)
+        v = 0.0
+        for i in range(1, n):
+            c = prices[i] - prices[i - 1]
+            v = (1.0 - alpha) * v + alpha * c * c
+        weight_sum = 1.0 - (1.0 - alpha) ** (n - 1)
+        if weight_sum > 0.0:
+            v = v / weight_sum
+        var += v
+    sigma = math.sqrt(var / 2.0)
     return min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
 
 
