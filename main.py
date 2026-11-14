@@ -14,9 +14,13 @@ an exponentially weighted moving variance of the 1-minute price changes
 (half-life 30 minutes, so it adapts to the current regime and forgets the
 wild settling phase a new market goes through). It is floored and capped so
 a quiet market never gets a degenerate zero spread and a single recent jump
-never blows the spread up, and the outer quantiles are widened a little
-(tail x1.3) because price moves are heavy-tailed: mostly flat minutes, then
-a tick, now and then a jump of twenty points.
+never blows the spread up; the EWMA variance is bias-corrected for short
+histories (its weights sum to 1 - (1 - alpha)**n, not 1), so a market that
+just started trading does not get a far-too-small spread. Non-finite prices
+are sanitized (last finite price carried forward) so bad data can never
+poison a forecast into NaN and invalidate a case. The outer quantiles are
+widened a little (tail x1.3) because price moves are heavy-tailed: mostly
+flat minutes, then a tick, now and then a jump of twenty points.
 
 Quantiles: q_tau(h) = clamp(x + z_tau * sigma * sqrt(h), 0, 1), with z the
 standard normal's quantile at each level and the outer z's (|z| > 1) scaled
@@ -55,7 +59,14 @@ def price6(x: float) -> float:
 
 
 def estimate_sigma(prices) -> float:
-    """EWMA standard deviation of the 1-minute price changes."""
+    """EWMA standard deviation of the 1-minute price changes.
+
+    Bias-corrected: the EWMA weights over n changes sum to
+    1 - (1 - alpha)**n, not 1, so for a short history the raw EWMA
+    underestimates the variance (a market with 2 prices would get a
+    22x-too-small variance). Dividing by the weight sum fixes that;
+    for a long history the correction is 1 and nothing changes.
+    """
     n = len(prices)
     if n < 2:
         return SIGMA_FLOOR
@@ -64,6 +75,9 @@ def estimate_sigma(prices) -> float:
     for i in range(1, n):
         c = prices[i] - prices[i - 1]
         var = (1.0 - alpha) * var + alpha * c * c
+    weight_sum = 1.0 - (1.0 - alpha) ** (n - 1)
+    if weight_sum > 0.0:
+        var = var / weight_sum
     sigma = math.sqrt(var)
     return min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
 
@@ -107,7 +121,16 @@ def main() -> None:
             prices = m["prices"]
             if not prices:
                 raise ValueError(f"market {m['id']} has no prices")
-            forecasts.append({"id": m["id"], "q": forecast_market(prices, horizon)})
+            # Sanitize: a non-finite price (bad data) would poison the
+            # forecast into NaN and invalidate the whole case, so carry
+            # the last finite price forward instead (0.5 if none yet).
+            clean = []
+            last = 0.5
+            for p in prices:
+                if isinstance(p, (int, float)) and math.isfinite(p):
+                    last = float(p)
+                clean.append(last)
+            forecasts.append({"id": m["id"], "q": forecast_market(clean, horizon)})
         out_path = out_dir / f"{case_id}.out"
         out_path.write_text(json.dumps({"forecasts": forecasts}) + "\n", encoding="utf-8")
 
